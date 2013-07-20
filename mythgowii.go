@@ -4,6 +4,7 @@ package main
 #cgo CFLAGS: -I/usr/include
 #cgo LDFLAGS: -lcwiid -L/usr/lib/libcwiid.a
 #include "mythgowii.h"
+#include <stdlib.h>
 #include <cwiid.h>
 #include <time.h>
 #include <bluetooth/bluetooth.h>
@@ -12,6 +13,7 @@ import "C"
 
 import (
 	"fmt"
+	"os"
 	"time"
 	"unsafe"
 )
@@ -30,8 +32,15 @@ func goCwiidCallback(wm unsafe.Pointer, a int, mesg []int, tp unsafe.Pointer) {
 func goErrCallback(wm unsafe.Pointer, char *C.char, ap unsafe.Pointer) {
 	//func goErrCallback(wm *C.cwiid_wiimote_t, char *C.char, ap C.va_list) {
 	str := C.GoString(char)
-	//wiimote := *C.cwiid_wiimote_t(wm)
-	fmt.Printf("Inside error calback - %s\n", str)
+	switch str {
+	case "No Bluetooth interface found":
+		fallthrough
+	case "no such device":
+		fmt.Printf("No Bluetooth device found\n")
+		os.Exit(1)
+	default:
+		fmt.Printf("Inside error calback - %s\n", str)
+	}
 }
 
 var hold chan bool
@@ -41,12 +50,18 @@ func main() {
 	var bdaddr C.bdaddr_t
 	var wm *C.struct_cwiid_wiimote_t
 	val, err := C.cwiid_set_err(C.getErrCallback())
-	fmt.Printf("Set the callback for errors - %d - %v", val, err)
+	if val != 0 || err != nil {
+		fmt.Printf("Error setting the callback to catch errors - %d - %v", val, err)
+		os.Exit(1)
+	}
 	for {
 		fmt.Println("Press 1&2 on the Wiimote now")
 		wm, err = C.cwiid_open(&bdaddr, 0)
 		if err != nil {
+			char := C.CString("no such device")
+			defer C.free(unsafe.Pointer(char))
 			fmt.Printf("Error is %v", err)
+			goErrCallback(nil, char, nil)
 		}
 		if wm != nil {
 			break
