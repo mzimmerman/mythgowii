@@ -12,9 +12,9 @@ package main
 import "C"
 
 import (
-	"fmt"
-	"os"
-	//"time"
+	"log"
+	"time"
+
 	"reflect"
 	"unsafe"
 )
@@ -33,10 +33,30 @@ var buttons = []_Ctype_uint16_t{
 	C.CWIID_BTN_PLUS,
 }
 
+const (
+	Connected    int8 = iota
+	Disconnected int8 = iota
+	Error        int8 = iota
+	Finished     int8 = iota
+)
+
+var buttonStatus []bool
+
+var wiimoteStatus int8 // accessed only inside the goCwiidCallback and the connectWiimote functions
+var tellWiimote chan bool
+var mythChan chan bool
 var buttonChan chan _Ctype_uint16_t
-var exit chan bool
-var callback = goCwiidCallback // so it's not garbage collected
-var errCallback = goErrCallback
+
+var callback = goCwiidCallback  // so it's not garbage collected
+var errCallback = goErrCallback // so it's not garbage collected
+
+func init() {
+	tellWiimote = make(chan bool)
+	wiimoteStatus = Disconnected
+	buttonChan = make(chan _Ctype_uint16_t)
+	mythChan = make(chan bool)
+	buttonStatus = make([]bool, len(buttons))
+}
 
 //export goCwiidCallback
 func goCwiidCallback(wm unsafe.Pointer, a int, mesg *C.struct_cwiid_btn_mesg, tp unsafe.Pointer) {
@@ -46,15 +66,21 @@ func goCwiidCallback(wm unsafe.Pointer, a int, mesg *C.struct_cwiid_btn_mesg, tp
 	sliceHeader.Cap = a
 	sliceHeader.Len = a
 	sliceHeader.Data = uintptr(unsafe.Pointer(mesg))
+	//log.Printf("Got messages %v from wiimote", messages)
 	for _, m := range messages {
 		if m._type != C.CWIID_MESG_BTN {
-			exit <- true
-			return
+			log.Printf("Got unexpected message %v from wiimote - %v", m)
+			tellWiimote <- true
+			continue
 		}
-		//fmt.Printf("Received message - %#v\n", m)
-		for _, button := range buttons {
+		for x, button := range buttons {
 			if m.buttons&button == button {
-				buttonChan <- button
+				if !buttonStatus[x] {
+					buttonChan <- button
+					buttonStatus[x] = true
+				}
+			} else {
+				buttonStatus[x] = false
 			}
 		}
 	}
@@ -62,93 +88,153 @@ func goCwiidCallback(wm unsafe.Pointer, a int, mesg *C.struct_cwiid_btn_mesg, tp
 
 //export goErrCallback
 func goErrCallback(wm unsafe.Pointer, char *C.char, ap unsafe.Pointer) {
-	//func goErrCallback(wm *C.cwiid_wiimote_t, char *C.char, ap C.va_list) {s
+	//func goErrCallback(wm *C.cwiid_wiimote_t, char *C.char, ap C.va_list) {
 	str := C.GoString(char)
+	log.Printf("Found error %s in goErrCallback", str)
 	switch str {
 	case "No Bluetooth interface found":
 		fallthrough
 	case "no such device":
-		fmt.Printf("No Bluetooth device found\n")
-		os.Exit(1)
+		log.Fatalf("No Bluetooth device found\n")
+	case "Socket connect error (control channel)":
+		fallthrough
+	case "No wiimotes found":
+		wiimoteStatus = Disconnected
 	default:
-		fmt.Printf("Inside error calback - %s\n", str)
+		log.Printf("Inside error callback - %s\n", str)
+		wiimoteStatus = Error
+	}
+}
+
+func connectMyth() {
+	for {
+		select {
+		case <-time.After(time.Second * 30):
+			mythChan <- false // still connected
+		}
 	}
 }
 
 func main() {
+	go connectWiimote()
+	go connectMyth()
+	for {
+		select {
+		case button := <-buttonChan:
+			switch button {
+			case C.CWIID_BTN_A:
+				log.Println("A")
+			case C.CWIID_BTN_B:
+				log.Println("B")
+			case C.CWIID_BTN_1:
+				log.Println("1")
+			case C.CWIID_BTN_2:
+				log.Println("2")
+			case C.CWIID_BTN_MINUS:
+				log.Println("Minus")
+			case C.CWIID_BTN_HOME:
+				log.Println("Home")
+			case C.CWIID_BTN_LEFT:
+				log.Println("Left")
+			case C.CWIID_BTN_RIGHT:
+				log.Println("Right")
+			case C.CWIID_BTN_DOWN:
+				log.Println("Down")
+			case C.CWIID_BTN_UP:
+				log.Println("Up")
+			case C.CWIID_BTN_PLUS:
+				log.Println("Plus")
+			}
+		case alive := <-mythChan:
+			log.Printf("Myth connected")
+			if !alive {
+				tellWiimote <- true
+			}
+		case <-time.After(time.Minute):
+			// nothing from either chan for a minute
+			log.Printf("Done watching, disconnected wiimote")
+			tellWiimote <- true
+		}
+	}
+}
+
+func connectWiimote() {
 	var bdaddr C.bdaddr_t
 	var wm *C.struct_cwiid_wiimote_t
-	buttonChan = make(chan _Ctype_uint16_t, 1)
-	exit = make(chan bool, 1)
 	val, err := C.cwiid_set_err(C.getErrCallback())
 	if val != 0 || err != nil {
-		fmt.Printf("Error setting the callback to catch errors - %d - %v", val, err)
-		os.Exit(1)
+		log.Fatalf("Error setting the callback to catch errors - %d - %v", val, err)
 	}
 	for {
-		fmt.Println("Press 1&2 on the Wiimote now")
+	outer:
+		for {
+			// clear the channels for any previous connection
+			select {
+			case <-tellWiimote:
+			case <-buttonChan:
+			default:
+				break outer
+			}
+		}
+		wiimoteStatus = Disconnected
+		log.Println("Press 1&2 on the Wiimote now")
 		wm, err = C.cwiid_open(&bdaddr, 0)
 		if err != nil {
-			fmt.Errorf("cwiid_open: %v\n", err)
+			log.Fatalf("cwiid_open: %v\n", err)
 			continue
 		}
-
-		res, err := C.cwiid_command(wm, C.CWIID_CMD_RPT_MODE, C.CWIID_RPT_BTN)
-		if res != 0 || err != nil {
-			fmt.Printf("Result of command = %d - %v\n", res, err)
+		if wm == nil {
+			continue // could not connect to wiimote
 		}
-
+		wiimoteStatus = Connected
+		res, err := C.cwiid_command(wm, C.CWIID_CMD_RPT_MODE, C.CWIID_RPT_BTN)
+		if res != 0 || err != nil || wiimoteStatus != Connected {
+			log.Printf("Result of command = %d - %v\n", res, err)
+			continue
+		}
 		res, err = C.cwiid_set_mesg_callback(wm, C.getCwiidCallback())
-		if res != 0 || err != nil {
-			fmt.Printf("Result of callback = %d - %v\n", res, err)
+		if res != 0 || err != nil || wiimoteStatus != Connected {
+			log.Printf("Result of callback = %d - %v\n", res, err)
+			continue
 		}
 		res, err = C.cwiid_enable(wm, C.CWIID_FLAG_MESG_IFC)
-		if res != 0 || err != nil {
-			fmt.Printf("Result of enable = %d - %v\n", res, err)
+		if res != 0 || err != nil || wiimoteStatus != Connected {
+			log.Printf("Result of enable = %d - %v\n", res, err)
+			continue
 		}
-
-		res, err = C.cwiid_set_led(wm, C.CWIID_LED2_ON)
-		if res != 0 || err != nil {
-			fmt.Printf("Set led result = %d\n", res)
-			fmt.Errorf("Err = %v", err)
+		res = C.cwiid_set_led(wm, C.CWIID_LED2_ON|C.CWIID_LED3_ON)
+		if res != 0 || wiimoteStatus != Connected {
+			log.Printf("Set led result = %d\n", res)
+			continue
 		}
-		fmt.Printf("Connected!\n")
+		res = C.cwiid_set_rumble(wm, 1)
+		if res != 0 || wiimoteStatus != Connected {
+			log.Printf("Unable to set rumble mode")
+			continue
+		}
+		time.Sleep(time.Millisecond * 200)
+		res = C.cwiid_set_rumble(wm, 0)
+		if res != 0 || wiimoteStatus != Connected {
+			log.Printf("Unable to unset rumble mode")
+			continue
+		}
 	loop:
 		for {
 			select {
-			case button := <-buttonChan:
-				switch button {
-				case C.CWIID_BTN_A:
-					fmt.Println("A")
-				case C.CWIID_BTN_B:
-					fmt.Println("B")
-				case C.CWIID_BTN_1:
-					fmt.Println("1")
-				case C.CWIID_BTN_2:
-					fmt.Println("2")
-				case C.CWIID_BTN_MINUS:
-					fmt.Println("Minus")
-				case C.CWIID_BTN_HOME:
-					fmt.Println("Home")
-				case C.CWIID_BTN_LEFT:
-					fmt.Println("Left")
-				case C.CWIID_BTN_RIGHT:
-					fmt.Println("Right")
-				case C.CWIID_BTN_DOWN:
-					fmt.Println("Down")
-				case C.CWIID_BTN_UP:
-					fmt.Println("Up")
-				case C.CWIID_BTN_PLUS:
-					fmt.Println("Plus")
+			case <-tellWiimote:
+				log.Printf("Being told to disconnect the wiimote")
+				if wm != nil {
+					log.Printf("Asking wiimote to be closed")
+					res, err := C.cwiid_close(wm)
+					if res != 0 || err != nil {
+						log.Printf("Unable to close wiimote")
+						continue
+					}
+					log.Printf("Closed wiimote")
 				}
-			case <-exit:
-				fmt.Println("Wiimote lost connection!")
-				res, err = C.cwiid_close(wm)
-				if res != 0 || err != nil {
-					fmt.Printf("Error closing wiimote - %d - %v\n", res, err)
-					return
-				}
-				break loop
+				wiimoteStatus = Disconnected
+				wm = nil
+				break loop // this takes us to the large loop above so that the wiimote can reconnect
 			}
 		}
 	}
