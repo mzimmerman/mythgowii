@@ -13,6 +13,7 @@ import "C"
 
 import (
 	"log"
+	"net/textproto"
 	"time"
 
 	"reflect"
@@ -44,17 +45,19 @@ var buttonStatus []bool
 
 var wiimoteStatus int8 // accessed only inside the goCwiidCallback and the connectWiimote functions
 var tellWiimote chan bool
-var mythChan chan bool
+var mythChanOut chan string
+var mythChanIn chan string
 var buttonChan chan _Ctype_uint16_t
 
 var callback = goCwiidCallback  // so it's not garbage collected
 var errCallback = goErrCallback // so it's not garbage collected
 
 func init() {
+	mythChanOut = make(chan string)
+	mythChanIn = make(chan string)
 	tellWiimote = make(chan bool)
 	wiimoteStatus = Disconnected
 	buttonChan = make(chan _Ctype_uint16_t)
-	mythChan = make(chan bool)
 	buttonStatus = make([]bool, len(buttons))
 }
 
@@ -106,11 +109,57 @@ func goErrCallback(wm unsafe.Pointer, char *C.char, ap unsafe.Pointer) {
 	}
 }
 
+func readAll(conn *textproto.Conn) {
+	for {
+		msg, err := conn.ReadLine()
+		if err != nil {
+			log.Printf("Error reading from myth - %v", err)
+			return
+		}
+		mythChanIn <- msg
+	}
+}
+
 func connectMyth() {
 	for {
-		select {
-		case <-time.After(time.Second * 30):
-			mythChan <- false // still connected
+	trashLoop:
+		for {
+			select {
+			case msg := <-mythChanIn:
+				log.Printf("Received %s", msg)
+			case msg := <-mythChanOut:
+				log.Printf("Can't send message - '%s'", msg)
+			default:
+				break trashLoop
+			}
+		}
+		conn, err := textproto.Dial("tcp", "localhost:6546")
+		if err != nil {
+			log.Printf("Error connecting to mythfrontend - %v", err)
+			time.Sleep(time.Second * 10)
+			continue
+		}
+		go readAll(conn)
+	connectedLoop:
+		for {
+			select {
+			case msg := <-mythChanIn:
+				log.Printf("Received %s", msg)
+				// if it's not playing for a while, send break
+			case msg := <-mythChanOut:
+				err = conn.PrintfLine(msg)
+				log.Printf("Sent message - '%s'", msg)
+				if err != nil {
+					log.Printf("Error found sending message %s - %v", msg, err)
+					break connectedLoop
+				}
+			case <-time.After(time.Second * 30):
+				err = conn.PrintfLine("query location")
+				if err != nil {
+					log.Printf("Error found querying location - %v", err)
+					break connectedLoop
+				}
+			}
 		}
 	}
 }
@@ -123,33 +172,34 @@ func main() {
 		case button := <-buttonChan:
 			switch button {
 			case C.CWIID_BTN_A:
-				log.Println("A")
+				mythChanOut <- "key enter"
 			case C.CWIID_BTN_B:
-				log.Println("B")
+				mythChanOut <- "key z"
 			case C.CWIID_BTN_1:
-				log.Println("1")
+				mythChanOut <- "key i"
 			case C.CWIID_BTN_2:
-				log.Println("2")
+				mythChanOut <- "key m"
 			case C.CWIID_BTN_MINUS:
-				log.Println("Minus")
+				mythChanOut <- "key d"
 			case C.CWIID_BTN_HOME:
-				log.Println("Home")
+				mythChanOut <- "key escape"
 			case C.CWIID_BTN_LEFT:
-				log.Println("Left")
+				mythChanOut <- "key left"
 			case C.CWIID_BTN_RIGHT:
-				log.Println("Right")
+				mythChanOut <- "key right"
 			case C.CWIID_BTN_DOWN:
-				log.Println("Down")
+				mythChanOut <- "key down"
 			case C.CWIID_BTN_UP:
-				log.Println("Up")
+				mythChanOut <- "key up"
 			case C.CWIID_BTN_PLUS:
-				log.Println("Plus")
+				mythChanOut <- "key p"
 			}
-		case alive := <-mythChan:
-			log.Printf("Myth connected")
-			if !alive {
-				tellWiimote <- true
-			}
+		case msg := <-mythChanIn:
+			log.Printf("Myth still connected, msg - %v", msg)
+			//TODO: disconnect wiimote if non command or status received
+			//if  {
+			//	tellWiimote <- true
+			//}
 		case <-time.After(time.Minute):
 			// nothing from either chan for a minute
 			log.Printf("Done watching, disconnected wiimote")
