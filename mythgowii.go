@@ -12,11 +12,12 @@ package main
 import "C"
 
 import (
+	"fmt"
 	"log"
 	"net/textproto"
-	"time"
-
 	"reflect"
+	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -99,65 +100,81 @@ func goErrCallback(wm unsafe.Pointer, char *C.char, ap unsafe.Pointer) {
 		fallthrough
 	case "no such device":
 		log.Fatalf("No Bluetooth device found\n")
+	case "Socket connect error (control socket)":
+		fallthrough
+	case "Socket connect error (interrupt socket)":
+		fallthrough
 	case "Socket connect error (control channel)":
 		fallthrough
 	case "No wiimotes found":
 		wiimoteStatus = Disconnected
 	default:
-		log.Printf("Inside error callback - %s\n", str)
+		log.Fatalf("Inside error callback - %s\n", str)
 		wiimoteStatus = Error
 	}
 }
 
-func readAll(conn *textproto.Conn) {
+func readAll(conn *textproto.Conn, mythError chan error) {
 	for {
 		msg, err := conn.ReadLine()
 		if err != nil {
-			log.Printf("Error reading from myth - %v", err)
+			mythError <- fmt.Errorf("Error reading from myth - %v", err)
 			return
 		}
-		mythChanIn <- msg
+		// if we're not watching something, don't send any notification
+		switch {
+		case strings.HasPrefix(msg, "# Playback Recorded"):
+			fallthrough
+		case strings.HasPrefix(msg, "# Playback Video"):
+			fallthrough
+		case strings.HasPrefix(msg, "# Playback DVD"):
+			mythChanIn <- msg
+		}
 	}
 }
 
-func connectMyth() {
+func connectMyth(conn *textproto.Conn, mythError chan error) (*textproto.Conn, error) {
+	if conn != nil {
+		return conn, nil
+	}
+	conn, err := textproto.Dial("tcp", "localhost:6546")
+	if err != nil {
+		log.Printf("Error connecting to mythfrontend - %v", err)
+		return nil, err
+	}
+	log.Printf("Connected to Myth")
+	mythChanIn <- "Connected"
+	go readAll(conn, mythError)
+	return conn, nil
+}
+
+func monitorMyth() {
+	var conn *textproto.Conn
+	var err error
+	mythError := make(chan error)
 	for {
-	trashLoop:
-		for {
-			select {
-			case msg := <-mythChanIn:
-				log.Printf("Received %s", msg)
-			case msg := <-mythChanOut:
-				log.Printf("Can't send message - '%s'", msg)
-			default:
-				break trashLoop
-			}
-		}
-		conn, err := textproto.Dial("tcp", "localhost:6546")
-		if err != nil {
-			log.Printf("Error connecting to mythfrontend - %v", err)
-			time.Sleep(time.Second * 10)
-			continue
-		}
-		go readAll(conn)
-	connectedLoop:
-		for {
-			select {
-			case msg := <-mythChanIn:
-				log.Printf("Received %s", msg)
-				// if it's not playing for a while, send break
-			case msg := <-mythChanOut:
-				err = conn.PrintfLine(msg)
-				log.Printf("Sent message - '%s'", msg)
+		select {
+		case err = <-mythError:
+			conn = nil
+			log.Printf("Got error reading from myth - %v")
+		case msg := <-mythChanOut:
+			conn, _ = connectMyth(conn, mythError)
+			if conn == nil {
+				log.Printf("Can't send message, not connected to mythfrontend - %s", msg)
+			} else {
+				_, err := conn.Cmd("%s", msg)
 				if err != nil {
-					log.Printf("Error found sending message %s - %v", msg, err)
-					break connectedLoop
+					log.Printf("Error writing to myth - %v", err)
+					conn = nil
 				}
-			case <-time.After(time.Second * 30):
-				err = conn.PrintfLine("query location")
+			}
+		case <-time.After(time.Second * 30):
+			conn, _ = connectMyth(conn, mythError)
+			if conn != nil {
+				_, err = conn.Cmd("query location")
 				if err != nil {
-					log.Printf("Error found querying location - %v", err)
-					break connectedLoop
+					log.Printf("Error getting status from myth - %v", err)
+					conn = nil
 				}
 			}
 		}
@@ -166,7 +183,7 @@ func connectMyth() {
 
 func main() {
 	go connectWiimote()
-	go connectMyth()
+	go monitorMyth()
 	for {
 		select {
 		case button := <-buttonChan:
@@ -196,20 +213,15 @@ func main() {
 			}
 		case msg := <-mythChanIn:
 			log.Printf("Myth still connected, msg - %v", msg)
-			//TODO: disconnect wiimote if non command or status received
-			//if  {
-			//	tellWiimote <- true
-			//}
 		case <-time.After(time.Minute):
 			// nothing from either chan for a minute
-			log.Printf("Done watching, disconnected wiimote")
+			//log.Printf("Done watching, disconnecting wiimote")
 			tellWiimote <- true
 		}
 	}
 }
 
 func connectWiimote() {
-	var bdaddr C.bdaddr_t
 	var wm *C.struct_cwiid_wiimote_t
 	val, err := C.cwiid_set_err(C.getErrCallback())
 	if val != 0 || err != nil {
@@ -228,14 +240,16 @@ func connectWiimote() {
 		}
 		wiimoteStatus = Disconnected
 		log.Println("Press 1&2 on the Wiimote now")
-		wm, err = C.cwiid_open(&bdaddr, 0)
+		wm, err = C.cwiid_open_timeout(nil, 0, 10)
 		if err != nil {
-			log.Fatalf("cwiid_open: %v\n", err)
+			log.Printf("cwiid_open: %v, sleeping...\n", err)
+			time.Sleep(time.Second)
 			continue
 		}
 		if wm == nil {
 			continue // could not connect to wiimote
 		}
+		log.Printf("Wiimote connected")
 		wiimoteStatus = Connected
 		res, err := C.cwiid_command(wm, C.CWIID_CMD_RPT_MODE, C.CWIID_RPT_BTN)
 		if res != 0 || err != nil || wiimoteStatus != Connected {
